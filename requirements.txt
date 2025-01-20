@@ -1,0 +1,4 @@
+numpy
+pymongo
+sentence-transformers
+PyPDF2
