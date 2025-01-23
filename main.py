@@ -1,135 +1,209 @@
 import os
+import json
+import re
 from dotenv import load_dotenv
 import numpy as np
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
-import PyPDF2
-from urllib.parse import quote_plus
+from tqdm import tqdm
+from sentence_transformers import CrossEncoder
+from docling.document_converter import DocumentConverter  # type: ignore
+from langchain.text_splitter import MarkdownHeaderTextSplitter
 
-# Load environment variables
 load_dotenv()
 
-# Load the embedding model
 def load_embedding_model():
     """Initialize and return the embedding model."""
-    return SentenceTransformer('sentence-transformers/gtr-t5-base')
+    return SentenceTransformer('thenlper/gte-base')
 
-# MongoDB connection
 def get_mongo_collection():
     """Connect to MongoDB and return the embeddings collection."""
     mongo_url = os.getenv("MONGO_URL")
     if not mongo_url:
         raise ValueError("MongoDB URL is not set in the environment variables.")
-    client = MongoClient(mongo_url,  serverSelectionTimeoutMS=30000)
+    client = MongoClient(mongo_url, serverSelectionTimeoutMS=30000)
     db = client["embedding_database"]
     return db["embeddings"]
 
-# Extract text from PDF
-def extract_text_from_pdf(pdf_path):
-    """Extract text from a PDF file."""
-    extracted_text = []
-    try:
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    extracted_text.append(text.strip())
-    except FileNotFoundError:
-        raise FileNotFoundError(f"PDF file not found at path: {pdf_path}")
-    return extracted_text
+def export_to_markdown(pdf_path):
+    """Convert the PDF content to Markdown format."""
+    converter = DocumentConverter()
+    result = converter.convert(pdf_path)
+    return result.document.export_to_markdown()
 
-# Generate and store embeddings in MongoDB
+def split_chunks(pdf_path):
+    """Convert PDF to markdown and split it into chunks."""
+    markdown_text = export_to_markdown(pdf_path=pdf_path)
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+    docs = markdown_splitter.split_text(markdown_text)
+    chunks = []
+
+    for i, doc in enumerate(docs):
+        try:
+            chunk = doc.page_content.strip()
+            if len(chunk) >= 100:
+                chunks.append(chunk)
+        except Exception as e:
+            print(f"Error processing chunk {i}: {e}")
+
+    return chunks
+
+def preprocess_text(text):
+    """Preprocess text by stripping and cleaning."""
+    return text.strip()
+
+def process_pdfs_for_chunks(pdf_paths):
+    """Process a list of PDF paths to generate chunks."""
+    all_chunks = []
+    for path in tqdm(pdf_paths, desc="Processing PDFs"):
+        try:
+            chunks = split_chunks(path)
+            for chunk in chunks:
+                chunk = preprocess_text(chunk)
+                if len(chunk) >= 100:
+                    all_chunks.append({"pdf_path": path, "text": chunk})
+        except FileNotFoundError:
+            print(f"PDF file not found: {path}")
+        except Exception as e:
+            print(f"Error processing PDF {path}: {e}")
+    return all_chunks
+
 def generate_and_store_embeddings(chunks, collection):
     """Generate embeddings for text chunks and store them in MongoDB."""
     model = load_embedding_model()
-    embeddings = model.encode(chunks, convert_to_tensor=True).tolist()
-    
-    docs = [{"chunk": chunk, "embedding": embedding} for chunk, embedding in zip(chunks, embeddings)]
+    embeddings = model.encode([chunk["text"] for chunk in chunks], convert_to_tensor=False).tolist()
+
+    docs = [
+        {
+            "pdf_path": chunk["pdf_path"],
+            "chunk": chunk["text"],
+            "embedding": embedding
+        }
+        for chunk, embedding in zip(chunks, embeddings)
+    ]
+
     try:
         collection.insert_many(docs)
         print(f"Inserted {len(docs)} embeddings into MongoDB.")
     except Exception as e:
         raise Exception(f"Failed to insert embeddings into MongoDB: {e}")
 
-# Get top N chunks before reranking
-def get_top_chunks_before_reranking(chunks, top_n):
-    """Return the top N chunks based on their original order."""
-    return chunks[:top_n]
+def extract_queries_from_text_file(query_text_file_path):
+    """Extract queries from a text file containing the list of queries."""
+    try:
+        with open(query_text_file_path, 'r') as file:
+            queries = file.readlines()
+            return [preprocess_text(query) for query in queries if query.strip()]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Query text file not found at path: {query_text_file_path}")
 
-# Rerank chunks based on query
-def rerank_chunks(chunks, embeddings, query, top_n):
-    """Rerank text chunks based on a query using cosine similarity."""
+def rerank_chunks(chunks, embeddings, query, top_n=5):
+    """
+    Rerank text chunks based on a query using embeddings for initial filtering 
+    and Cross-Encoder for reranking.
+    """
     model = load_embedding_model()
-    query_embedding = model.encode(query, convert_to_tensor=True)
-    
-    # Normalize embeddings for cosine similarity calculation
-    query_embedding = query_embedding / np.linalg.norm(query_embedding)
-    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-    
-    # Calculate cosine similarities
+    query_embedding = model.encode(preprocess_text(query), convert_to_tensor=False)
+    query_embedding /= np.linalg.norm(query_embedding)
+
+    embeddings = np.array(embeddings)
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+
     scores = np.dot(embeddings, query_embedding)
 
-    # Sort and retrieve top N chunks
-    ranked_indices = np.argsort(scores)[::-1][:top_n]
-    ranked_chunks = [(chunks[i], scores[i]) for i in ranked_indices]
+    top_20_indices = np.argsort(scores)[::-1][:20]
+    top_20_chunks = [chunks[i] for i in top_20_indices]
 
-    return ranked_chunks
+    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    inputs = [(preprocess_text(query), preprocess_text(chunk["text"])) for chunk in top_20_chunks]
 
-# Save text chunks with ranking to a file
-def save_to_file(file_path, chunks_with_ranking):
-    """Save ranked text chunks to a file."""
+    rerank_scores = cross_encoder.predict(inputs)
+
+    reranked_chunks = [{"text": chunk["text"], "score": score} for chunk, score in zip(top_20_chunks, rerank_scores)]
+    reranked_chunks = sorted(reranked_chunks, key=lambda x: x["score"], reverse=True)
+
+    return reranked_chunks[:top_n]
+
+def save_to_json(before_file_path, after_file_path, queries, top_chunks_list, reranked_chunks_list):
+    """Save chunks before and after reranking to separate JSON files."""
     try:
-        with open(file_path, 'w') as file:
-            for rank, (chunk, score) in enumerate(chunks_with_ranking, start=1):
-                file.write(f"Rank {rank}:\n")
-                file.write(f"{chunk}\n")
-                file.write(f"Score: {score:.4f}\n\n")
+        if not (len(queries) == len(top_chunks_list) == len(reranked_chunks_list)):
+            raise ValueError(
+                "Mismatch in lengths of queries, top_chunks_list, and reranked_chunks_list. "
+                f"Lengths: queries={len(queries)}, top_chunks_list={len(top_chunks_list)}, "
+                f"reranked_chunks_list={len(reranked_chunks_list)}"
+            )
+        before_data = [
+            {
+                "query": queries[i],
+                "top_chunks_before_reranking": [
+                    {
+                        "chunk": chunk["text"],
+                        "score": 0 
+                    }
+                    if isinstance(chunk, dict) else {"chunk": chunk, "score": 0} 
+                    for chunk in top_chunks_list[i]
+                ]
+            }
+            for i in range(len(queries))
+        ]
+        after_data = [
+            {
+                "query": queries[i],
+                "top_chunks_after_reranking": [
+                    {
+                        "chunk": chunk["text"],
+                        "score": float(chunk["score"])
+                    }
+                    if isinstance(chunk, dict) else {"chunk": chunk, "score": 0}  
+                    for chunk in reranked_chunks_list[i]
+                ]
+            }
+            for i in range(len(queries))
+        ]
+        with open(before_file_path, 'w') as before_file:
+            json.dump(before_data, before_file, indent=4)
+
+        with open(after_file_path, 'w') as after_file:
+            json.dump(after_data, after_file, indent=4)
+
     except Exception as e:
-        raise Exception(f"Failed to save to file {file_path}: {e}")
+        raise Exception(f"Failed to save to files {before_file_path} and {after_file_path}: {e}")
 
-# Main script
+
 if __name__ == "__main__":
-    pdf_path = "/home/shtlp_0010/Desktop/Embedding_Reranking/assets/genai.pdf"
+    pdf_paths = ["/home/shtlp_0010/Desktop/Embedding_Reranking/assets/FinancialManagement.pdf"]
+    query_text_file_path = "/home/shtlp_0010/Desktop/Embedding_Reranking/assets/queries.txt"
+    before_results_path = "/home/shtlp_0010/Desktop/Embedding_Reranking/assets/before_reranking.json"
+    after_results_path = "/home/shtlp_0010/Desktop/Embedding_Reranking/assets/after_reranking.json"
 
-    # Step 1: Extract text chunks from PDF
-    chunks = extract_text_from_pdf(pdf_path)
+    chunks = process_pdfs_for_chunks(pdf_paths)
     if not chunks:
-        raise ValueError("No text extracted from the PDF.")
+        raise ValueError("No text extracted from the PDF files.")
 
-    # Step 2: Connect to MongoDB
     collection = get_mongo_collection()
 
-    # Step 3: Generate and store embeddings
-    generate_and_store_embeddings(chunks, collection)
+    if collection.count_documents({}) == 0:
+        generate_and_store_embeddings(chunks, collection)
 
-    # Step 4: Retrieve embeddings from MongoDB
     records = list(collection.find())
     embeddings = [np.array(record["embedding"]) for record in records]
+    chunks = [{"text": record["chunk"], "pdf_path": record["pdf_path"]} for record in records]
+    queries = extract_queries_from_text_file(query_text_file_path)
 
-    # Ensure alignment between chunks and records
-    chunks = chunks[:len(records)]
+    top_chunks_list = []
+    reranked_chunks_list = []
 
-    # Step 5: Save top 5 chunks before reranking
-    top_5_chunks = get_top_chunks_before_reranking(chunks, top_n=5)
-    before_reranking_path = "/home/shtlp_0010/Desktop/Embedding_Reranking/assets/before_reranking.txt"
-    save_to_file(before_reranking_path, [(chunk, 0) for chunk in top_5_chunks])
-    print(f"Top 5 chunks before reranking saved to {before_reranking_path}.")
+    for query in queries:
+        reranked_chunks = rerank_chunks(chunks, embeddings, query, top_n=5)
+        top_chunks_list.append([{"text": chunk["text"], "score": 0} for chunk in reranked_chunks])
+        reranked_chunks_list.append(reranked_chunks)
 
-    # Step 6: Rerank chunks based on a query
-    query = "What factors have contributed to the rapid advancement of Generative AI tools to human-level performance?"
-    ranked_chunks = rerank_chunks(chunks, np.array(embeddings), query, top_n=5)
+    save_to_json(before_results_path, after_results_path, queries, top_chunks_list, reranked_chunks_list)
 
-    # Save top 5 chunks after reranking
-    after_reranking_path = "/home/shtlp_0010/Desktop/Embedding_Reranking/assets/after_reranking.txt"
-    save_to_file(after_reranking_path, ranked_chunks)
-    print(f"Top 5 chunks after reranking saved to {after_reranking_path}.")
-
-    # Print results
-    print("\nTop 5 chunks before reranking:")
-    for i, chunk in enumerate(top_5_chunks, start=1):
-        print(f"Rank {i}: {chunk}")
-
-    print("\nTop 5 chunks after reranking:")
-    for i, (chunk, score) in enumerate(ranked_chunks, start=1):
-        print(f"Rank {i}: {chunk} (Score: {score:.4f})")
+    print(f"Results saved to {before_results_path} and {after_results_path}.")
